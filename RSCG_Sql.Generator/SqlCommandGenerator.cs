@@ -122,15 +122,27 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
 
     private static string GetHintName(string filePath, string projectDirectory)
     {
-        var relativePath = string.IsNullOrEmpty(projectDirectory)
-            ? Path.IsPathRooted(filePath) ? Path.GetFileName(filePath) : filePath
-            : Uri.UnescapeDataString(
-                new Uri(projectDirectory.TrimEnd('\\', '/') + Path.DirectorySeparatorChar)
-                    .MakeRelativeUri(new Uri(filePath)).ToString());
+        var relativePath = Path.IsPathRooted(filePath) ? Path.GetFileName(filePath) : filePath;
+        if (!string.IsNullOrEmpty(projectDirectory))
+        {
+            var fullPath = Path.GetFullPath(filePath);
+            var directoryPrefix = Path.GetFullPath(projectDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var comparison = Path.DirectorySeparatorChar == '\\'
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            relativePath = fullPath.StartsWith(directoryPrefix, comparison)
+                ? fullPath.Substring(directoryPrefix.Length)
+                : Path.GetFileName(fullPath);
+        }
+
         var fileName = Path.ChangeExtension(relativePath, null) ?? relativePath;
-        var hintName = fileName
-            .Replace('\\', '_')
-            .Replace('/', '_');
+        var hintName = new StringBuilder(fileName.Length);
+        foreach (var character in fileName)
+        {
+            hintName.Append(char.IsLetterOrDigit(character) ||
+                character is '_' or '-' or '.' or ' ' ? character : '_');
+        }
         return $"{hintName}.g.cs";
     }
 
@@ -359,7 +371,14 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
                 MethodKind.Query,
                 returnType,
                 null,
-                selectIndexes[0],
+                statementNodes.Take(selectIndexes[0]).Count(statement => statement switch
+                {
+                    InsertStatement insert => insert.InsertSpecification.OutputClause is not null,
+                    UpdateStatement update => update.UpdateSpecification.OutputClause is not null,
+                    DeleteStatement delete => delete.DeleteSpecification.OutputClause is not null,
+                    MergeStatement merge => merge.MergeSpecification.OutputClause is not null,
+                    _ => false
+                }),
                 GetResultColumnNames(statementNodes[selectIndexes[0]]));
             return true;
         }
@@ -403,7 +422,7 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
                 MethodKind.InsertId,
                 null,
                 idType,
-                identitySelectIndex,
+                0,
                 []);
             return true;
         }
@@ -424,7 +443,7 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
             isRowsAffected ? MethodKind.RowsAffected : MethodKind.NonQuery,
             null,
             null,
-            -1,
+            0,
             []);
         return true;
     }
@@ -569,86 +588,63 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
         builder.AppendLine("            throw new global::System.InvalidOperationException(\"The supplied DbConnection must already be open.\");");
         builder.AppendLine("        }");
 
-        var identityIndex = method.IdentitySelectIndex;
-        var resultSelectIndex = method.Kind == MethodKind.Query
-            ? method.IdentitySelectIndex
-            : -1;
-        if (method.Kind == MethodKind.RowsAffected)
+        switch (method.Kind)
         {
-            builder.AppendLine("        var affectedRows = 0;");
-        }
-
-        for (var index = 0; index < method.Statements.Length; index++)
-        {
-            if (index == identityIndex && method.Kind == MethodKind.InsertId)
-            {
-                continue;
-            }
-
-            var isOutputIdentity = method.Kind == MethodKind.InsertId &&
-                Regex.IsMatch(method.Statements[index], @"OUTPUT\s+INSERTED\.ID\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-            var isResultQuery = index == resultSelectIndex && method.Kind == MethodKind.Query;
-            var executeScalar = isOutputIdentity;
-            if (isResultQuery)
-            {
-                EmitQuery(builder, method, index);
-            }
-            else if (executeScalar)
-            {
-                EmitIdScalar(builder, method, index);
-            }
-            else
-            {
-                EmitNonQuery(builder, method, index, method.Kind == MethodKind.RowsAffected);
-            }
-        }
-
-        if (method.Kind == MethodKind.Query)
-        {
-            return;
-        }
-
-        if (method.Kind == MethodKind.InsertId)
-        {
-            if (identityIndex >= 0)
-            {
-                EmitIdScalar(builder, method, identityIndex);
-            }
-
-            builder.AppendLine("        return insertedId;");
-        }
-        else if (method.Kind == MethodKind.RowsAffected)
-        {
-            builder.AppendLine("        return affectedRows;");
+            case MethodKind.Query:
+                EmitQuery(builder, method);
+                return;
+            case MethodKind.InsertId:
+                EmitIdScalar(builder, method);
+                builder.AppendLine("        return insertedId;");
+                break;
+            default:
+                EmitNonQuery(builder, method, method.Kind == MethodKind.RowsAffected);
+                break;
         }
 
         builder.AppendLine("    }");
         builder.AppendLine();
     }
 
-    private static void EmitNonQuery(StringBuilder builder, GeneratedMethod method, int index, bool countRows)
+    private static void EmitNonQuery(StringBuilder builder, GeneratedMethod method, bool countRows)
     {
         builder.AppendLine("        await using (var command = connection.CreateCommand())");
         builder.AppendLine("        {");
-        builder.Append("            command.CommandText = ").Append(Literal(method.Statements[index])).AppendLine(";");
+        builder.Append("            command.CommandText = ").Append(Literal(string.Join("\n", method.Statements))).AppendLine(";");
         EmitParameters(builder, method.Parameters);
         builder.AppendLine("            var rows = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);");
         if (countRows)
         {
-            builder.AppendLine("            affectedRows += rows;");
+            builder.AppendLine("            return rows;");
         }
 
         builder.AppendLine("        }");
     }
 
-    private static void EmitQuery(StringBuilder builder, GeneratedMethod method, int index)
+    private static void EmitQuery(StringBuilder builder, GeneratedMethod method)
     {
         builder.AppendLine("        var results = new global::System.Collections.Generic.List<" + method.ResultType + ">();");
         builder.AppendLine("        await using (var command = connection.CreateCommand())");
         builder.AppendLine("        {");
-        builder.Append("            command.CommandText = ").Append(Literal(method.Statements[index])).AppendLine(";");
+        builder.Append("            command.CommandText = ").Append(Literal(string.Join("\n", method.Statements))).AppendLine(";");
         EmitParameters(builder, method.Parameters);
         builder.AppendLine("            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);");
+        builder.AppendLine("            while (reader.FieldCount == 0)");
+        builder.AppendLine("            {");
+        builder.AppendLine("                if (!await reader.NextResultAsync(cancellationToken).ConfigureAwait(false))");
+        builder.AppendLine("                    throw new global::System.InvalidOperationException(\"The annotated SELECT did not return a result set.\");");
+        builder.AppendLine("            }");
+        if (method.QueryResultIndex > 0)
+        {
+            builder.Append("            for (var resultIndex = 0; resultIndex < ").Append(method.QueryResultIndex).AppendLine("; resultIndex++)");
+            builder.AppendLine("            {");
+            builder.AppendLine("                do");
+            builder.AppendLine("                {");
+            builder.AppendLine("                    if (!await reader.NextResultAsync(cancellationToken).ConfigureAwait(false))");
+            builder.AppendLine("                        throw new global::System.InvalidOperationException(\"The annotated SELECT did not return a result set.\");");
+            builder.AppendLine("                } while (reader.FieldCount == 0);");
+            builder.AppendLine("            }");
+        }
         builder.AppendLine("            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))");
         builder.AppendLine("            {");
         builder.Append("                var item = (").Append(method.ResultType)
@@ -678,18 +674,19 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
         builder.AppendLine("                }");
         builder.AppendLine("                results.Add(item);");
         builder.AppendLine("            }");
+        builder.AppendLine("            while (await reader.NextResultAsync(cancellationToken).ConfigureAwait(false)) { }");
         builder.AppendLine("        }");
         builder.AppendLine("        return results.ToArray();");
         builder.AppendLine("    }");
         builder.AppendLine();
     }
 
-    private static void EmitIdScalar(StringBuilder builder, GeneratedMethod method, int index)
+    private static void EmitIdScalar(StringBuilder builder, GeneratedMethod method)
     {
         builder.AppendLine("        object? insertedValue;");
         builder.AppendLine("        await using (var command = connection.CreateCommand())");
         builder.AppendLine("        {");
-        builder.Append("            command.CommandText = ").Append(Literal(method.Statements[index])).AppendLine(";");
+        builder.Append("            command.CommandText = ").Append(Literal(string.Join("\n", method.Statements))).AppendLine(";");
         EmitParameters(builder, method.Parameters);
         builder.AppendLine("            insertedValue = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);");
         builder.AppendLine("        }");
@@ -780,7 +777,7 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
         MethodKind Kind,
         string? ResultType,
         string? IdType,
-        int IdentitySelectIndex,
+        int QueryResultIndex,
         string?[] ResultColumnNames)
     {
         public List<IPropertySymbol> ResultProperties { get; } = [];

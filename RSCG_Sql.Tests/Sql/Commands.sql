@@ -24,3 +24,13 @@ UPDATE people SET age = @age WHERE id = @id;
 GO
 -- @Name DeletePerson
 DELETE FROM people WHERE id = @id;
+GO
+-- @Name UpdateAndGetPerson
+UPDATE people SET age = 38 WHERE id = @id;
+-- @Returns Person
+SELECT id AS Id, name AS Name, age AS Age FROM people WHERE id = @id;
+UPDATE people SET age = 39 WHERE id = @id;
+GO
+-- @Name UpdatePersonTwice
+UPDATE people SET age = 40 WHERE id = @id;
+UPDATE people SET age = 41 WHERE id = @id;
