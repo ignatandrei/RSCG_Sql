@@ -1,0 +1,71 @@
+https://github.com/mattpocock/skills/blob/main/skills/productivity/grilling/SKILL.md
+
+Read file @instructions.md . Grill me before starting the app . After finish, write in a file what it is needed
+for the app
+
+----
+
+read the *.md files
+
+
+Please implement the project and run the tests to ensure it works
+
+
+Done with
+
+    <AdditionalFiles Include="Sql\Commands.sql" />
+
+        context.AddSource("SqlCommands.g.cs", SourceText.From(EmitSource(rootNamespace, methods), Encoding.UTF8));
+
+The name of the file generated must be the name of the additional file - with the folder name first , separated by _ . Add to final instructions file and
+implement and redo the tests
+
+
+---
+
+read @final_instructions.md . Do not do anything !
+
+Modify this code 
+var property = item.GetType().GetProperty(reader.GetName(column), global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.Public | global::System.Reflection.BindingFlags.IgnoreCase);
+
+Find the name of the property from the name of the what is selected into the select ( preserve the case)
+
+
+throw an error when the column is not into the list
+var columnName = column switch
+                    {
+                        0 => "id",
+                        1 => "name",
+                        _ => reader.GetName(column)
+                    };
+
+and get rid of property.getvalue and property.setvalue ( call directly the property)
+
+
+I do not want
+
+SetProperty(item.Id, reader.GetValue(column), value => item.Id = value);
+
+Use direct column names
+
+
+
+Could you optimize ConvertProperty<T> ? For example, store targetType into something to not calculate every time in the while for reader 
+
+
+
+Could the Roslyn Code Generator inspect the type returned from Select and find properties that matches the column and the types and wrote the code accordingly ?
+
+
+I still see  ConvertProperty . Please convert to the type of column
+
+-------
+
+read @final_instructions.md . Do not do anything !
+
+please add to the Roslyn .csproj project everything it is needed to have info for a nuget package( you are in a github repo) 
+
+please add also a github action to build and test and pack the project
+
+------
+
