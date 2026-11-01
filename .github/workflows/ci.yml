@@ -24,8 +24,15 @@ jobs:
       - name: Run tests
         run: dotnet test RSCG_Sql.Tests/RSCG_Sql.Tests.csproj --configuration Release --no-build
 
+      - name: Calculate package version
+        id: package-version
+        shell: pwsh
+        run: |
+          $version = ./scripts/Get-PackageVersion.ps1
+          "version=$version" >> $env:GITHUB_OUTPUT
+
       - name: Pack generator
-        run: dotnet pack RSCG_Sql.Generator/RSCG_Sql.Generator.csproj --configuration Release --no-build --output artifacts/packages
+        run: dotnet pack RSCG_Sql.Generator/RSCG_Sql.Generator.csproj --configuration Release --no-build --output artifacts/packages -p:Version=${{ steps.package-version.outputs.version }}
 
       - name: Upload NuGet package
         uses: actions/upload-artifact@v4
