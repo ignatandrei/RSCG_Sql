@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="RSCG_Sql.Generator\RSCG_Sql.Generator.csproj" />
+  <Project Path="RSCG_Sql.Tests\RSCG_Sql.Tests.csproj" />
+  <Project Path="RSCG_Sql.Sample\RSCG_Sql.Sample.csproj" />
+</Solution>
