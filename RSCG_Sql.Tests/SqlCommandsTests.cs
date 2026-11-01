@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Data;
 using System.Data.Common;
 using System.Reflection;
@@ -123,6 +124,7 @@ public sealed class SqlCommandsTests
     [DataRow("query")]
     [DataRow("insert")]
     [DataRow("insert-output")]
+    [DataRow("identity-order")]
     [DataRow("rows")]
     [DataRow("non-query")]
     public async Task GeneratedBatchExecutesAsOneCommand(string kind)
@@ -132,7 +134,8 @@ public sealed class SqlCommandsTests
             "query" => "-- @Name RunBatch\nDECLARE @value INT = 7;\nUPDATE People SET Id = @value OUTPUT INSERTED.Id;\n-- @Returns Person\nSELECT @value AS Id;\nUPDATE People SET Id = 8;",
             "insert" => "-- @Name RunBatch\nDECLARE @value INT = 7;\n-- @IdType long\nINSERT INTO People (Id) VALUES (@value);\nSELECT scope_identity();",
             "insert-output" => "-- @Name RunBatch\nDECLARE @value INT = 7;\n-- @IdType long\nINSERT INTO People (Id) OUTPUT INSERTED.Id VALUES (@value);",
-            "rows" => "-- @Name RunBatch\nDECLARE @value INT = 7;\nUPDATE People SET Id = @value;\nDELETE FROM People WHERE Id = @value;",
+            "identity-order" => "-- @Name RunBatch\n-- @IdType long\nINSERT INTO People (Id) VALUES (7);\nSELECT last_insert_rowid() FROM People;\nDELETE FROM People;",
+            "rows" => "-- @Name RunBatch\nDECLARE @value INT = 7;\nUPDATE People SET Id = @value;\nCREATE TABLE Audit (Id INT);\nDELETE FROM People WHERE Id = @value;",
             _ => "-- @Name RunBatch\nDECLARE @value INT = 7;\nSET @value = 8;"
         };
         var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
@@ -147,7 +150,7 @@ public sealed class SqlCommandsTests
             generators: [new SqlCommandGenerator().AsSourceGenerator()],
             additionalTexts: [new TestAdditionalText("Batch.sql", sql)]);
         driver.RunGeneratorsAndUpdateCompilation(compilation, out var output, out var diagnostics);
-        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(diagnostics, string.Join(Environment.NewLine, diagnostics));
         using var stream = new MemoryStream();
         var emit = output.Emit(stream);
         Assert.IsTrue(emit.Success, string.Join(Environment.NewLine, emit.Diagnostics));
@@ -160,7 +163,10 @@ public sealed class SqlCommandsTests
 
         Assert.AreEqual(1, connection.CommandsCreated);
         Assert.AreEqual(1, connection.Command.Executions);
-        StringAssert.Contains(connection.Command.CommandText, "DECLARE @value INT = 7;");
+        if (kind != "identity-order")
+        {
+            StringAssert.Contains(connection.Command.CommandText, "DECLARE @value INT = 7;");
+        }
         Assert.DoesNotContain("-- @", connection.Command.CommandText);
         if (kind == "query")
         {
@@ -171,11 +177,25 @@ public sealed class SqlCommandsTests
             Assert.AreEqual(7L, results.GetValue(0)!.GetType().GetProperty("Id")!.GetValue(results.GetValue(0)));
             Assert.IsTrue(connection.Command.Reader!.IsClosed);
         }
-        else if (kind is "insert" or "insert-output")
+        else if (kind is "insert" or "insert-output" or "identity-order")
         {
             Assert.AreEqual("scalar", connection.Command.ExecutionKind);
-            StringAssert.Contains(connection.Command.CommandText,
-                kind == "insert" ? "SELECT scope_identity();" : "OUTPUT INSERTED.Id");
+            if (kind == "insert")
+            {
+                StringAssert.Contains(connection.Command.CommandText, "SELECT scope_identity();");
+            }
+            else if (kind == "insert-output")
+            {
+                StringAssert.Contains(connection.Command.CommandText, "OUTPUT INSERTED.Id");
+            }
+            else
+            {
+                var insertPosition = connection.Command.CommandText.IndexOf("INSERT INTO", StringComparison.Ordinal);
+                var identityPosition = connection.Command.CommandText.IndexOf("SELECT last_insert_rowid()", StringComparison.Ordinal);
+                var deletePosition = connection.Command.CommandText.IndexOf("DELETE FROM", StringComparison.Ordinal);
+                Assert.IsTrue(insertPosition < identityPosition && identityPosition < deletePosition);
+            }
+
             Assert.AreEqual(42L, task.GetType().GetProperty("Result")!.GetValue(task));
         }
         else
@@ -183,6 +203,7 @@ public sealed class SqlCommandsTests
             Assert.AreEqual("non-query", connection.Command.ExecutionKind);
             if (kind == "rows")
             {
+                StringAssert.Contains(connection.Command.CommandText, "CREATE TABLE Audit");
                 Assert.AreEqual(5, task.GetType().GetProperty("Result")!.GetValue(task));
             }
         }
@@ -208,6 +229,208 @@ public sealed class SqlCommandsTests
         Assert.DoesNotContain("GetProperty(", generated);
         Assert.DoesNotContain("SetValue(", generated);
         Assert.DoesNotContain("SetProperty(", generated);
+    }
+
+    [TestMethod]
+    public void BatchSeparatorInsideMultilineStringIsPreserved()
+    {
+        var sql = "-- @Name GetPerson\n-- @Returns Person\nSELECT 'first\nGO\nlast' AS Name;\nGO\n-- @Name CreatePeople\nCREATE TABLE People (Id INT);";
+        var (driver, output, diagnostics) = RunGenerator(
+            CreateTestCompilation("namespace Generated { public class Person { public string? Name { get; set; } } }"),
+            new TestAdditionalText("Queries.sql", sql));
+
+        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(output.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+        var generated = driver.GetRunResult().GeneratedTrees.Single().GetText().ToString();
+        StringAssert.Contains(generated, "GO\\nlast");
+        StringAssert.Contains(generated, "CreatePeopleAsync");
+    }
+
+    [TestMethod]
+    public void GlobalResultTypeIgnoresRootNamespaceFallback()
+    {
+        var source = """
+            namespace Generated.Models { public class Person { public int Name { get; set; } } }
+            namespace Models { public class Person { public string Name { get; set; } = ""; } }
+            """;
+        var (driver, output, diagnostics) = RunGenerator(
+            CreateTestCompilation(source),
+            new TestAdditionalText("Queries.sql", "-- @Name GetPerson\n-- @Returns global::Models.Person\nSELECT 'Ada' AS Name;"));
+
+        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(output.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+        StringAssert.Contains(driver.GetRunResult().GeneratedTrees.Single().GetText().ToString(),
+            "item.Name = global::System.Convert.ToString");
+    }
+
+    [TestMethod]
+    public void OverriddenResultPropertiesAreMatchedOnlyOnce()
+    {
+        var source = """
+            namespace Generated {
+                public class BasePerson { public virtual string Name { get; set; } = ""; }
+                public class Person : BasePerson { public override string Name { get; set; } = ""; }
+            }
+            """;
+        var (driver, output, diagnostics) = RunGenerator(
+            CreateTestCompilation(source),
+            new TestAdditionalText("Queries.sql", "-- @Name GetPerson\n-- @Returns Person\nSELECT 'Ada' AS Name;"));
+
+        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(output.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+        Assert.HasCount(1, driver.GetRunResult().GeneratedTrees);
+    }
+
+    [TestMethod]
+    public void IdentityStringLiteralIsNotTreatedAsIdentityExpression()
+    {
+        var (driver, _, diagnostics) = RunGenerator(
+            CreateTestCompilation("namespace Generated { public class Person { public long Id { get; set; } } }"),
+            new TestAdditionalText("Insert.sql",
+                "-- @Name InsertPerson\n-- @IdType long\nINSERT INTO People (Id) VALUES (1);\nSELECT 'last_insert_rowid()';"));
+
+        Assert.IsTrue(diagnostics.Any(diagnostic =>
+            diagnostic.Id == "SQLGEN002" &&
+            diagnostic.GetMessage().Contains("recognized identity expression", StringComparison.Ordinal)));
+        Assert.IsEmpty(driver.GetRunResult().GeneratedTrees);
+    }
+
+    [TestMethod]
+    public void InsertWithTwoIdentitySourcesIsRejected()
+    {
+        var (driver, _, diagnostics) = RunGenerator(
+            CreateTestCompilation("namespace Generated { public class Person { public long Id { get; set; } } }"),
+            new TestAdditionalText("Insert.sql",
+                "-- @Name InsertPerson\n-- @IdType long\nINSERT INTO People (Id) OUTPUT INSERTED.Id VALUES (1);\nSELECT last_insert_rowid();"));
+
+        Assert.IsTrue(diagnostics.Any(diagnostic =>
+            diagnostic.GetMessage().Contains("both an OUTPUT identity and an identity SELECT", StringComparison.Ordinal)));
+        Assert.IsEmpty(driver.GetRunResult().GeneratedTrees);
+    }
+
+    [TestMethod]
+    public void HelpersAreEmittedOnlyOnceAcrossSqlFiles()
+    {
+        var (driver, output, diagnostics) = RunGenerator(
+            CreateTestCompilation("namespace Generated { }"),
+            new TestAdditionalText("First.sql",
+                "-- @Name InsertFirst\n-- @IdType long\nINSERT INTO People (Id) VALUES (1);\nSELECT last_insert_rowid();"),
+            new TestAdditionalText("Second.sql",
+                "-- @Name InsertSecond\n-- @IdType long\nINSERT INTO People (Id) VALUES (2);\nSELECT last_insert_rowid();"));
+
+        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(output.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+        Assert.AreEqual(1, driver.GetRunResult().GeneratedTrees
+            .Sum(tree => CountOccurrences(tree.GetText().ToString(), "private static T ConvertResult<T>")));
+    }
+
+    [TestMethod]
+    public void SqlParameterNamesDoNotCollideWithGeneratedIdentifiers()
+    {
+        var source = """
+            namespace Generated {
+                public class Person {
+                    public long Id { get; set; }
+                    public string? Name { get; set; }
+                    public long Age { get; set; }
+                    public string? FirstName { get; set; }
+                }
+            }
+            """;
+        var sql = "-- @Name GetPerson\n-- @Returns Person\nSELECT @connection AS Id, @cancellationToken AS Name, @command AS Age, @results AS FirstName;";
+        var (driver, output, diagnostics) = RunGenerator(
+            CreateTestCompilation(source),
+            new TestAdditionalText("Queries.sql", sql));
+
+        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(output.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+        var generated = driver.GetRunResult().GeneratedTrees.Single().GetText().ToString();
+        StringAssert.Contains(generated, "object? connection_2");
+        StringAssert.Contains(generated, "object? cancellationToken_2");
+        StringAssert.Contains(generated, ".ParameterName = \"@connection\"");
+        StringAssert.Contains(generated, ".ParameterName = \"@cancellationToken\"");
+    }
+
+    [TestMethod]
+    public void DistinctSqlParameterSpellingsAreBothBound()
+    {
+        var source = "namespace Generated { public class Person { public long Id { get; set; } public long Age { get; set; } } }";
+        var (driver, output, diagnostics) = RunGenerator(
+            CreateTestCompilation(source),
+            new TestAdditionalText("Queries.sql",
+                "-- @Name GetPerson\n-- @Returns Person\nSELECT @id AS Id, @ID AS Age;"));
+
+        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(output.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+        var generated = driver.GetRunResult().GeneratedTrees.Single().GetText().ToString();
+        StringAssert.Contains(generated, ".ParameterName = \"@id\"");
+        StringAssert.Contains(generated, ".ParameterName = \"@ID\"");
+        Assert.AreEqual(2, CountOccurrences(generated, "command.Parameters.Add("));
+    }
+
+    [TestMethod]
+    public void ExternalParameterTypeIsInferredFromDeclarationInitializer()
+    {
+        var source = "namespace Generated { public class Person { public int Id { get; set; } } }";
+        var (driver, output, diagnostics) = RunGenerator(
+            CreateTestCompilation(source),
+            new TestAdditionalText("Queries.sql",
+                "-- @Name GetPerson\nDECLARE @local INT = @input;\n-- @Returns Person\nSELECT @local AS Id;"));
+
+        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(output.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+        StringAssert.Contains(driver.GetRunResult().GeneratedTrees.Single().GetText().ToString(), "int input");
+    }
+
+    [TestMethod]
+    public void NullableResultPropertyIsAssignedWhenColumnIsNull()
+    {
+        var source = "namespace Generated { public class Person { public string? Name { get; set; } = \"fallback\"; } }";
+        var (driver, output, diagnostics) = RunGenerator(
+            CreateTestCompilation(source),
+            new TestAdditionalText("Queries.sql",
+                "-- @Name GetPerson\n-- @Returns Person\nSELECT NULL AS Name;"));
+
+        Assert.IsEmpty(diagnostics);
+        Assert.IsEmpty(output.GetDiagnostics().Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+        StringAssert.Contains(driver.GetRunResult().GeneratedTrees.Single().GetText().ToString(),
+            "item.Name = default!;");
+    }
+
+    private static (GeneratorDriver Driver, Compilation Output, ImmutableArray<Diagnostic> Diagnostics) RunGenerator(
+        CSharpCompilation compilation,
+        params TestAdditionalText[] additionalFiles)
+    {
+        GeneratorDriver driver = CSharpGeneratorDriver.Create(
+            generators: [new SqlCommandGenerator().AsSourceGenerator()],
+            additionalTexts: additionalFiles);
+        driver = driver.RunGeneratorsAndUpdateCompilation(compilation, out var output, out var diagnostics);
+        return (driver, output, diagnostics);
+    }
+
+    private static CSharpCompilation CreateTestCompilation(string source)
+    {
+        var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+            .Split(Path.PathSeparator)
+            .Select(path => MetadataReference.CreateFromFile(path));
+        return CSharpCompilation.Create(
+            "GeneratorRegressionTests_" + Guid.NewGuid().ToString("N"),
+            [CSharpSyntaxTree.ParseText(source)],
+            references,
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+    }
+
+    private static int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+
+        return count;
     }
 
     private static CSharpCompilation CreateResultCompilation(string name) =>

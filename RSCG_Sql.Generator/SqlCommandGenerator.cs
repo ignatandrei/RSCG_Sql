@@ -335,76 +335,76 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
 
     private static IEnumerable<BatchBoundary> FindBatchSeparators(string text)
     {
-            var state = SqlLexicalState.Normal;
-            var blockCommentDepth = 0;
-            var lineStart = 0;
-            while (lineStart < text.Length)
+        var state = SqlLexicalState.Normal;
+        var blockCommentDepth = 0;
+        var lineStart = 0;
+        while (lineStart < text.Length)
+        {
+            var lineEnd = text.IndexOfAny(['\r', '\n'], lineStart);
+            if (lineEnd < 0)
             {
-                var lineEnd = text.IndexOfAny(['\r', '\n'], lineStart);
-                if (lineEnd < 0)
-                {
-                    lineEnd = text.Length;
-                }
-
-                var line = text.Substring(lineStart, lineEnd - lineStart);
-                var newlineLength = lineEnd == text.Length
-                    ? 0
-                    : text[lineEnd] == '\r' && lineEnd + 1 < text.Length && text[lineEnd + 1] == '\n' ? 2 : 1;
-                if (state == SqlLexicalState.Normal && BatchSeparatorLine.IsMatch(line))
-                {
-                    yield return new BatchBoundary(lineStart, line.Length + newlineLength);
-                    lineStart = lineEnd + newlineLength;
-                    continue;
-                }
-
-                for (var index = lineStart; index < lineEnd; index++)
-                {
-                    var current = text[index];
-                    var next = index + 1 < lineEnd ? text[index + 1] : '\0';
-                    if (state == SqlLexicalState.Normal && current == '-' && next == '-') break;
-                    switch (state)
-                    {
-                        case SqlLexicalState.Normal:
-                            if (current == '/' && next == '*')
-                            {
-                                state = SqlLexicalState.BlockComment;
-                                blockCommentDepth++;
-                                index++;
-                            }
-                            else if (current == '\'') state = SqlLexicalState.SingleQuoted;
-                            else if (current == '"') state = SqlLexicalState.DoubleQuoted;
-                            else if (current == '[') state = SqlLexicalState.BracketQuoted;
-                            break;
-                        case SqlLexicalState.SingleQuoted:
-                            if (current == '\'' && next == '\'') index++;
-                            else if (current == '\'') state = SqlLexicalState.Normal;
-                            break;
-                        case SqlLexicalState.DoubleQuoted:
-                            if (current == '"' && next == '"') index++;
-                            else if (current == '"') state = SqlLexicalState.Normal;
-                            break;
-                        case SqlLexicalState.BracketQuoted:
-                            if (current == ']' && next == ']') index++;
-                            else if (current == ']') state = SqlLexicalState.Normal;
-                            break;
-                        case SqlLexicalState.BlockComment:
-                            if (current == '/' && next == '*')
-                            {
-                                blockCommentDepth++;
-                                index++;
-                            }
-                            else if (current == '*' && next == '/')
-                            {
-                                blockCommentDepth--;
-                                index++;
-                                if (blockCommentDepth == 0) state = SqlLexicalState.Normal;
-                            }
-                            break;
-                    }
-                }
-
-                lineStart = lineEnd + newlineLength;
+                lineEnd = text.Length;
             }
+
+            var line = text.Substring(lineStart, lineEnd - lineStart);
+            var newlineLength = lineEnd == text.Length
+                ? 0
+                : text[lineEnd] == '\r' && lineEnd + 1 < text.Length && text[lineEnd + 1] == '\n' ? 2 : 1;
+            if (state == SqlLexicalState.Normal && BatchSeparatorLine.IsMatch(line))
+            {
+                yield return new BatchBoundary(lineStart, line.Length + newlineLength);
+                lineStart = lineEnd + newlineLength;
+                continue;
+            }
+
+            for (var index = lineStart; index < lineEnd; index++)
+            {
+                var current = text[index];
+                var next = index + 1 < lineEnd ? text[index + 1] : '\0';
+                if (state == SqlLexicalState.Normal && current == '-' && next == '-') break;
+                switch (state)
+                {
+                    case SqlLexicalState.Normal:
+                        if (current == '/' && next == '*')
+                        {
+                            state = SqlLexicalState.BlockComment;
+                            blockCommentDepth++;
+                            index++;
+                        }
+                        else if (current == '\'') state = SqlLexicalState.SingleQuoted;
+                        else if (current == '"') state = SqlLexicalState.DoubleQuoted;
+                        else if (current == '[') state = SqlLexicalState.BracketQuoted;
+                        break;
+                    case SqlLexicalState.SingleQuoted:
+                        if (current == '\'' && next == '\'') index++;
+                        else if (current == '\'') state = SqlLexicalState.Normal;
+                        break;
+                    case SqlLexicalState.DoubleQuoted:
+                        if (current == '"' && next == '"') index++;
+                        else if (current == '"') state = SqlLexicalState.Normal;
+                        break;
+                    case SqlLexicalState.BracketQuoted:
+                        if (current == ']' && next == ']') index++;
+                        else if (current == ']') state = SqlLexicalState.Normal;
+                        break;
+                    case SqlLexicalState.BlockComment:
+                        if (current == '/' && next == '*')
+                        {
+                            blockCommentDepth++;
+                            index++;
+                        }
+                        else if (current == '*' && next == '/')
+                        {
+                            blockCommentDepth--;
+                            index++;
+                            if (blockCommentDepth == 0) state = SqlLexicalState.Normal;
+                        }
+                        break;
+                }
+            }
+
+            lineStart = lineEnd + newlineLength;
+        }
     }
 
     private static string ExtractStatement(string batchText, TSqlStatement statement)
@@ -555,9 +555,22 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
 
     private static bool IsIdentitySelect(TSqlStatement statement)
     {
-        var visitor = new IdentityExpressionCollector();
-        statement.Accept(visitor);
-        return visitor.Found;
+        if (statement is not SelectStatement { QueryExpression: QuerySpecification query })
+        {
+            return false;
+        }
+
+        foreach (var column in query.SelectElements.OfType<SelectScalarExpression>())
+        {
+            var visitor = new IdentityExpressionCollector();
+            column.Expression.Accept(visitor);
+            if (visitor.Found)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool HasOutputIdentity(InsertStatement statement) =>
