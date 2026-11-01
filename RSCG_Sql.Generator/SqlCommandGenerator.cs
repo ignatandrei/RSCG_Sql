@@ -24,19 +24,15 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
         "SQLGEN002", "Invalid SQL batch", "{0}", "SQL generation",
         DiagnosticSeverity.Error, isEnabledByDefault: true);
 
-    private static readonly Regex BatchSeparator = new(
-        @"(?im)^[ \t]*GO[ \t]*(?:--[^\r\n]*)?[ \t]*(?:\r?\n|$)",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex BatchSeparatorLine = new(
+        @"^[ \t]*GO[ \t]*(?:--[^\r\n]*)?[ \t]*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex Annotation = new(
         @"(?im)^\s*--\s*@(?<key>Name|Returns|IdType)\s+(?<value>[^\r\n]+?)\s*$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex AnnotationComment = new(
         @"(?im)^\s*--\s*@(Name|Returns|IdType)\s+[^\r\n]*(?:\r?\n|$)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly Regex IdentityExpression = new(
-        @"@@identity\b|scope_identity\s*\(\s*\)|ident_current\s*\(|last_insert_rowid\s*\(\s*\)|currval\s*\(",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var sqlFiles = context.AdditionalTextsProvider
@@ -112,11 +108,14 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
             }
         }
 
-        foreach (var generatedFile in generatedFiles)
+        var helperFileIndex = generatedFiles.FindIndex(
+            generatedFile => generatedFile.Methods.Any(method => method.Kind == MethodKind.InsertId));
+        for (var index = 0; index < generatedFiles.Count; index++)
         {
+            var generatedFile = generatedFiles[index];
             context.AddSource(
                 generatedFile.HintName,
-                SourceText.From(EmitSource(rootNamespace, generatedFile.Methods), Encoding.UTF8));
+                SourceText.From(EmitSource(rootNamespace, generatedFile.Methods, index == helperFileIndex), Encoding.UTF8));
         }
     }
 
@@ -149,9 +148,12 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
     private static bool TryResolveResult(
         SourceProductionContext context, Compilation compilation, string rootNamespace, GeneratedMethod method)
     {
-        var typeName = method.ResultType!.Replace("global::", string.Empty);
-        var type = compilation.GetTypeByMetadataName(rootNamespace + "." + typeName) ??
-            compilation.GetTypeByMetadataName(typeName);
+        var isGlobalQualified = method.ResultType!.StartsWith("global::", StringComparison.Ordinal);
+        var typeName = isGlobalQualified ? method.ResultType.Substring("global::".Length) : method.ResultType;
+        var type = isGlobalQualified
+            ? compilation.GetTypeByMetadataName(typeName)
+            : compilation.GetTypeByMetadataName(rootNamespace + "." + typeName) ??
+              compilation.GetTypeByMetadataName(typeName);
         if (type is null)
         {
             context.ReportDiagnostic(Diagnostic.Create(InvalidBatch, Location.None,
@@ -159,15 +161,21 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
             return false;
         }
 
-        var properties = new List<IPropertySymbol>();
+        var properties = new Dictionary<string, IPropertySymbol>(StringComparer.Ordinal);
         for (var current = type; current is not null; current = current.BaseType)
         {
-            properties.AddRange(current.GetMembers().OfType<IPropertySymbol>());
+            foreach (var property in current.GetMembers().OfType<IPropertySymbol>())
+            {
+                if (!properties.ContainsKey(property.Name))
+                {
+                    properties.Add(property.Name, property);
+                }
+            }
         }
 
         foreach (var column in method.ResultColumnNames)
         {
-            var matches = properties.Where(property =>
+            var matches = properties.Values.Where(property =>
                 !property.IsStatic && !property.IsIndexer &&
                 property.DeclaredAccessibility == Accessibility.Public &&
                 property.SetMethod is { DeclaredAccessibility: Accessibility.Public, IsInitOnly: false } &&
@@ -237,12 +245,12 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
     private static IEnumerable<GeneratedMethod?> ParseFile(SourceProductionContext context, SqlFile file)
     {
         var batchStart = 0;
-        foreach (Match separator in BatchSeparator.Matches(file.Text).Cast<Match>().Append(null!))
+        foreach (var separator in FindBatchSeparators(file.Text).Append(new BatchBoundary(file.Text.Length, 0)))
         {
-            var batchEnd = separator?.Index ?? file.Text.Length;
+            var batchEnd = separator.Index;
             var batchText = file.Text.Substring(batchStart, batchEnd - batchStart);
             var startOffset = batchStart;
-            batchStart = separator is null ? file.Text.Length : separator.Index + separator.Length;
+            batchStart = separator.Index + separator.Length;
 
             if (string.IsNullOrWhiteSpace(batchText))
             {
@@ -325,6 +333,80 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
         }
     }
 
+    private static IEnumerable<BatchBoundary> FindBatchSeparators(string text)
+    {
+            var state = SqlLexicalState.Normal;
+            var blockCommentDepth = 0;
+            var lineStart = 0;
+            while (lineStart < text.Length)
+            {
+                var lineEnd = text.IndexOfAny(['\r', '\n'], lineStart);
+                if (lineEnd < 0)
+                {
+                    lineEnd = text.Length;
+                }
+
+                var line = text.Substring(lineStart, lineEnd - lineStart);
+                var newlineLength = lineEnd == text.Length
+                    ? 0
+                    : text[lineEnd] == '\r' && lineEnd + 1 < text.Length && text[lineEnd + 1] == '\n' ? 2 : 1;
+                if (state == SqlLexicalState.Normal && BatchSeparatorLine.IsMatch(line))
+                {
+                    yield return new BatchBoundary(lineStart, line.Length + newlineLength);
+                    lineStart = lineEnd + newlineLength;
+                    continue;
+                }
+
+                for (var index = lineStart; index < lineEnd; index++)
+                {
+                    var current = text[index];
+                    var next = index + 1 < lineEnd ? text[index + 1] : '\0';
+                    if (state == SqlLexicalState.Normal && current == '-' && next == '-') break;
+                    switch (state)
+                    {
+                        case SqlLexicalState.Normal:
+                            if (current == '/' && next == '*')
+                            {
+                                state = SqlLexicalState.BlockComment;
+                                blockCommentDepth++;
+                                index++;
+                            }
+                            else if (current == '\'') state = SqlLexicalState.SingleQuoted;
+                            else if (current == '"') state = SqlLexicalState.DoubleQuoted;
+                            else if (current == '[') state = SqlLexicalState.BracketQuoted;
+                            break;
+                        case SqlLexicalState.SingleQuoted:
+                            if (current == '\'' && next == '\'') index++;
+                            else if (current == '\'') state = SqlLexicalState.Normal;
+                            break;
+                        case SqlLexicalState.DoubleQuoted:
+                            if (current == '"' && next == '"') index++;
+                            else if (current == '"') state = SqlLexicalState.Normal;
+                            break;
+                        case SqlLexicalState.BracketQuoted:
+                            if (current == ']' && next == ']') index++;
+                            else if (current == ']') state = SqlLexicalState.Normal;
+                            break;
+                        case SqlLexicalState.BlockComment:
+                            if (current == '/' && next == '*')
+                            {
+                                blockCommentDepth++;
+                                index++;
+                            }
+                            else if (current == '*' && next == '/')
+                            {
+                                blockCommentDepth--;
+                                index++;
+                                if (blockCommentDepth == 0) state = SqlLexicalState.Normal;
+                            }
+                            break;
+                    }
+                }
+
+                lineStart = lineEnd + newlineLength;
+            }
+    }
+
     private static string ExtractStatement(string batchText, TSqlStatement statement)
     {
         var start = Math.Max(0, Math.Min(statement.StartOffset, batchText.Length));
@@ -389,14 +471,21 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
             .Select(item => item.index)
             .ToArray();
         var identitySelectIndex = selectIndexes
-            .Where(index => IdentityExpression.IsMatch(statements[index]))
+            .Where(index => IsIdentitySelect(statementNodes[index]))
             .DefaultIfEmpty(-1)
             .First();
         var hasOutputIdentity = insertIndexes.Any(index =>
-            Regex.IsMatch(statements[index], @"OUTPUT\s+INSERTED\.ID\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant));
+            statementNodes[index] is InsertStatement insert && HasOutputIdentity(insert));
 
         if (insertIndexes.Length > 0)
         {
+            if (identitySelectIndex >= 0 && hasOutputIdentity)
+            {
+                ReportInvalid(context, file, batchStart,
+                    $"Insert batch '{methodName}' cannot contain both an OUTPUT identity and an identity SELECT.");
+                return false;
+            }
+
             if (insertIndexes.Length != 1 ||
                 !annotations.TryGetValue("IdType", out var idType) ||
                 !IsIdType(idType) ||
@@ -464,34 +553,83 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
             .ToArray();
     }
 
+    private static bool IsIdentitySelect(TSqlStatement statement)
+    {
+        var visitor = new IdentityExpressionCollector();
+        statement.Accept(visitor);
+        return visitor.Found;
+    }
+
+    private static bool HasOutputIdentity(InsertStatement statement) =>
+        statement.InsertSpecification.OutputClause?.SelectColumns
+            .OfType<SelectScalarExpression>()
+            .Any(column =>
+                column.Expression is ColumnReferenceExpression reference &&
+                reference.MultiPartIdentifier.Identifiers.Count >= 2 &&
+                reference.MultiPartIdentifier.Identifiers[reference.MultiPartIdentifier.Identifiers.Count - 2].Value.Equals("inserted", StringComparison.OrdinalIgnoreCase) &&
+                reference.MultiPartIdentifier.Identifiers[reference.MultiPartIdentifier.Identifiers.Count - 1].Value.Equals("id", StringComparison.OrdinalIgnoreCase)) == true;
+
     private static ImmutableArray<SqlParameter> CollectParameters(TSqlBatch batch)
     {
         var declarations = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var inferredTypes = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var statement in batch.Statements.OfType<DeclareVariableStatement>())
         {
             foreach (var declaration in statement.Declarations)
             {
                 var name = declaration.VariableName.Value;
-                declarations[name] = declaration.DataType is SqlDataTypeReference sqlType
+                var type = declaration.DataType is SqlDataTypeReference sqlType
                     ? MapSqlType(sqlType.Name.BaseIdentifier.Value)
                     : "object?";
+                declarations[name] = type;
+                if (declaration.Value is VariableReference source && !inferredTypes.ContainsKey(source.Name))
+                {
+                    inferredTypes.Add(source.Name, type);
+                }
             }
         }
 
         var visitor = new VariableReferenceCollector();
         batch.Accept(visitor);
-        return visitor.Variables
+        var variables = visitor.Variables
             .Where(variable =>
                 !variable.Name.StartsWith("@@", StringComparison.Ordinal) &&
                 !declarations.ContainsKey(variable.Name))
-            .GroupBy(variable => variable.Name, StringComparer.OrdinalIgnoreCase)
+            .GroupBy(variable => variable.Name, StringComparer.Ordinal)
             .Select(group => group.First())
             .OrderBy(variable => variable.Offset)
-            .Select(variable => new SqlParameter(
+            .ToArray();
+        var usedIdentifiers = new HashSet<string>(
+            ["connection", "cancellationToken", "command", "results", "reader", "resultIndex", "item",
+             "column", "insertedValue", "insertedId", "rows"],
+            StringComparer.Ordinal);
+        for (var index = 0; index < variables.Length; index++)
+        {
+            usedIdentifiers.Add("sqlParameter_" + index);
+        }
+
+        var parameters = ImmutableArray.CreateBuilder<SqlParameter>(variables.Length);
+        foreach (var variable in variables)
+        {
+            var identifier = SafeIdentifier(variable.Name.TrimStart('@'));
+            var baseIdentifier = identifier;
+            var suffix = 2;
+            while (!usedIdentifiers.Add(identifier))
+            {
+                identifier = baseIdentifier + "_" + suffix++;
+            }
+
+            parameters.Add(new SqlParameter(
                 variable.Name.TrimStart('@'),
-                declarations.TryGetValue(variable.Name, out var type) ? type : "object?"))
-            .ToImmutableArray();
+                inferredTypes.TryGetValue(variable.Name, out var type) ? type : "object?",
+                identifier));
+        }
+
+        return parameters.ToImmutable();
     }
+
+    private static bool IsNullableType(ITypeSymbol type) =>
+        type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Nullable_T };
 
     private static string MapSqlType(string sqlType) => sqlType.ToLowerInvariant() switch
     {
@@ -542,7 +680,10 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
         });
     }
 
-    private static string EmitSource(string rootNamespace, IReadOnlyList<GeneratedMethod> methods)
+    private static string EmitSource(
+        string rootNamespace,
+        IReadOnlyList<GeneratedMethod> methods,
+        bool includeHelpers)
     {
         var builder = new StringBuilder();
         builder.AppendLine("// <auto-generated />");
@@ -557,7 +698,7 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
             EmitMethod(builder, method);
         }
 
-        if (methods.Any(method => method.Kind is MethodKind.Query or MethodKind.InsertId))
+        if (includeHelpers)
         {
             EmitHelpers(builder);
         }
@@ -577,7 +718,7 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
         };
         var parameters = new List<string> { "global::System.Data.Common.DbConnection connection" };
         parameters.AddRange(method.Parameters.Select(parameter =>
-            $"{parameter.Type} {EscapeIdentifier(parameter.Name)}"));
+            $"{parameter.Type} {EscapeIdentifier(parameter.Identifier)}"));
         parameters.Add("global::System.Threading.CancellationToken cancellationToken = default");
 
         builder.Append("    public static async ").Append(returnType).Append(' ')
@@ -658,12 +799,26 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
             if (method.ResultColumnNames[column] is not null)
             {
                 builder.Append("                        case ").Append(column).AppendLine(":");
-                builder.AppendLine("                            if (!await reader.IsDBNullAsync(column, cancellationToken).ConfigureAwait(false))");
-                builder.AppendLine("                            {");
                 var property = method.ResultProperties[column];
-                builder.Append("                                item.").Append(EscapeIdentifier(property.Name))
-                    .Append(" = ").Append(PropertyConversion(property.Type, "reader.GetValue(column)")).AppendLine(";");
-                builder.AppendLine("                            }");
+                var propertyAccess = "item." + EscapeIdentifier(property.Name);
+                if (property.Type.IsReferenceType || IsNullableType(property.Type))
+                {
+                    builder.AppendLine("                            if (await reader.IsDBNullAsync(column, cancellationToken).ConfigureAwait(false))");
+                    builder.Append("                                ").Append(propertyAccess).AppendLine(" = default!;");
+                    builder.AppendLine("                            else");
+                    builder.AppendLine("                            {");
+                    builder.Append("                                ").Append(propertyAccess).Append(" = ")
+                        .Append(PropertyConversion(property.Type, "reader.GetValue(column)")).AppendLine(";");
+                    builder.AppendLine("                            }");
+                }
+                else
+                {
+                    builder.AppendLine("                            if (!await reader.IsDBNullAsync(column, cancellationToken).ConfigureAwait(false))");
+                    builder.AppendLine("                            {");
+                    builder.Append("                                ").Append(propertyAccess).Append(" = ")
+                        .Append(PropertyConversion(property.Type, "reader.GetValue(column)")).AppendLine(";");
+                    builder.AppendLine("                            }");
+                }
                 builder.AppendLine("                            break;");
             }
         }
@@ -697,15 +852,16 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
 
     private static void EmitParameters(StringBuilder builder, ImmutableArray<SqlParameter> parameters)
     {
-        foreach (var parameter in parameters)
+        for (var index = 0; index < parameters.Length; index++)
         {
-            var name = EscapeIdentifier(parameter.Name);
-            builder.AppendLine("            var sqlParameter_" + SafeIdentifier(parameter.Name) + " = command.CreateParameter();");
-            builder.Append("            sqlParameter_").Append(SafeIdentifier(parameter.Name)).Append(".ParameterName = ")
+            var parameter = parameters[index];
+            var localName = "sqlParameter_" + index;
+            builder.Append("            var ").Append(localName).AppendLine(" = command.CreateParameter();");
+            builder.Append("            ").Append(localName).Append(".ParameterName = ")
                 .Append(Literal("@" + parameter.Name)).AppendLine(";");
-            builder.Append("            sqlParameter_").Append(SafeIdentifier(parameter.Name)).Append(".Value = (object?)")
-                .Append(name).AppendLine(" ?? global::System.DBNull.Value;");
-            builder.Append("            command.Parameters.Add(sqlParameter_").Append(SafeIdentifier(parameter.Name)).AppendLine(");");
+            builder.Append("            ").Append(localName).Append(".Value = (object?)")
+                .Append(EscapeIdentifier(parameter.Identifier)).AppendLine(" ?? global::System.DBNull.Value;");
+            builder.Append("            command.Parameters.Add(").Append(localName).AppendLine(");");
         }
     }
 
@@ -769,7 +925,8 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
 
     private sealed record SqlFile(string Path, string Text);
     private sealed record SqlVariable(string Name, int Offset);
-    private sealed record SqlParameter(string Name, string Type);
+    private sealed record SqlParameter(string Name, string Type, string Identifier);
+    private sealed record BatchBoundary(int Index, int Length);
     private sealed record GeneratedMethod(
         string Name,
         string[] Statements,
@@ -789,5 +946,42 @@ public sealed class SqlCommandGenerator : IIncrementalGenerator
         InsertId,
         RowsAffected,
         NonQuery
+    }
+
+    private enum SqlLexicalState
+    {
+        Normal,
+        SingleQuoted,
+        DoubleQuoted,
+        BracketQuoted,
+        BlockComment
+    }
+
+    private sealed class IdentityExpressionCollector : TSqlFragmentVisitor
+    {
+        public bool Found { get; private set; }
+
+        public override void ExplicitVisit(FunctionCall node)
+        {
+            if (node.FunctionName.Value.Equals("scope_identity", StringComparison.OrdinalIgnoreCase) ||
+                node.FunctionName.Value.Equals("ident_current", StringComparison.OrdinalIgnoreCase) ||
+                node.FunctionName.Value.Equals("last_insert_rowid", StringComparison.OrdinalIgnoreCase) ||
+                node.FunctionName.Value.Equals("currval", StringComparison.OrdinalIgnoreCase))
+            {
+                Found = true;
+            }
+
+            base.ExplicitVisit(node);
+        }
+
+        public override void ExplicitVisit(GlobalVariableExpression node)
+        {
+            if (node.Name.Equals("@@identity", StringComparison.OrdinalIgnoreCase))
+            {
+                Found = true;
+            }
+
+            base.ExplicitVisit(node);
+        }
     }
 }
