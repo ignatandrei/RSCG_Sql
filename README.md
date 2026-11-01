@@ -2,9 +2,25 @@
 
 `RSCG_Sql.Generator` is a netstandard2.0 Roslyn incremental source generator that reads `.sql` files registered as `AdditionalFiles`. It parses each `GO`-separated batch with Microsoft ScriptDom and generates asynchronous methods in a `SqlCommands` class in the consuming project's `RootNamespace`. It emits one source file per SQL AdditionalFile, named using its relative folders and file name joined by underscores (for example, `Sql\Commands.sql` becomes `Sql_Commands.g.cs`). The tests and sample target .NET 10.
 
-## Use
+## Install from NuGet
 
-Register the generator project as an analyzer and add your SQL file as an additional file:
+Install the published [`RSCG_Sql` package](https://www.nuget.org/packages/RSCG_Sql/2026.11.1.1516):
+
+```powershell
+dotnet add package RSCG_Sql --version 2026.11.1.1516
+```
+
+Or add it directly to your project:
+
+```xml
+<ItemGroup>
+<PackageReference Include="RSCG_Sql" Version="2026.11.1.1516" />
+<AdditionalFiles Include="Sql\Commands.sql" />
+<CompilerVisibleProperty Include="MSBuildProjectDirectory" />
+</ItemGroup>
+```
+
+The package includes the generator and its ScriptDom runtime under `analyzers/dotnet/cs`. For local development against this repository, reference the generator project as an analyzer and include the ScriptDom assembly:
 
 ```xml
 <ProjectReference Include="..\RSCG_Sql.Generator\RSCG_Sql.Generator.csproj"
