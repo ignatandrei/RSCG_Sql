@@ -1,19 +1,19 @@
-Now about generating and verifying the package
+Now I will describe how I generated and verified the package.
 
 -------
 
-read @final_instructions.md . Do not do anything !
+I asked the AI to read @final_instructions.md and do nothing else.
 
-please add to the Roslyn .csproj project everything it is needed to have info for a nuget package( you are in a github repo) 
+I asked it to add the information that the Roslyn .csproj project needs for a NuGet package. I also noted that the project is in a GitHub repository.
 
-please add also a github action to build and test and pack the project
+I also asked it to add a GitHub Action to build, test, and pack the project.
 
 
-Now I want the nuget package to have the version implemented as the current date down to minutes. Make a powershell for this. Implement in CI
+Then I asked it to set the NuGet package version to the current date and time, down to the minute. I asked it to write a PowerShell script for this and implement it in CI.
 
 ------
 
-As you see , pretty simple. And yes, he has generated a powershell and put the code in CI
+As you can see, this seemed simple. The AI generated a PowerShell script and added the code to CI:
 
 ```powershell
 
