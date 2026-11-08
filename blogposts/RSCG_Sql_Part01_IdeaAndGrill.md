@@ -1,15 +1,15 @@
 
-I have met this repo - https://github.com/colinhacks/reylo . It transforms files into typescript with content mappers https://github.com/microsoft/typescript-go/pull/4712
+I found this repository: https://github.com/colinhacks/reylo. It transforms files into TypeScript with content mappers. I also found this TypeScript feature: https://github.com/microsoft/typescript-go/pull/4712.
 
-This is same with Roslyn Code Generator from AdditionalFiles
+I saw a similar idea in Roslyn source generators that use `AdditionalFiles`.
 
-So I said - this could be a nice additions for C# .
+I thought this could be a useful addition to C#.
 
-I did know how to do it - with ROslyn and https://www.nuget.org/packages/Microsoft.SqlServer.TransactSql.ScriptDom
+I knew how to build it with Roslyn and https://www.nuget.org/packages/Microsoft.SqlServer.TransactSql.ScriptDom.
 
-However, I said : how about the AI will do for me  ? 
+Then I asked myself: could AI do this work for me?
 
-So I started with instructions
+I started by writing instructions:
 
 ```md
 
@@ -42,16 +42,16 @@ The Roslyn Code Generator must have tests for SQLite in memeory ( leave Postgres
 
 ```
 
-And I have install one of my favorite skill , https://github.com/mattpocock/skills/blob/main/skills/productivity/grilling/SKILL.md - wuth one difference : max 30 questions
+I installed one of my favorite skills: https://github.com/mattpocock/skills/blob/main/skills/productivity/grilling/SKILL.md. I changed one setting: I set the maximum number of questions to 30.
 
-And after grilling
+After the grilling, I gave these instructions:
 
 ```txt
 Read file @instructions.md . Grill me before starting the app . After finish, write in a file what it is needed
 for the app
 ```
 
-this was the final result of instructions:
+These were the final instructions I received:
 
 ```md
 
