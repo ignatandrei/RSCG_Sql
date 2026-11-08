@@ -1,6 +1,6 @@
-Now , because I have the tests and everything and review with CodeRabbit, I was thinking it is done .
+I had the tests and a CodeRabbit review, so I thought the project was complete.
 
-So I tried copilot
+Then I tried Copilot.
 
 ```text
 Unresolved critical defects prevent the packaged generator from running for consumers and cause accepted SQL inputs to produce compiler errors or incorrect runtime behavior.
@@ -23,14 +23,14 @@ Medium severity Count only UPDATE and DELETE affected rows · New
 Medium severity Assign null when materializing DBNull values · New
 
 ```
-Happy for me there is 
+I was glad to find this option:
 
 ```
 
 Fix batch with copilot 
 ```
 
-And the result was
+I got this result:
 
 ```
 5 resolved since last review
@@ -50,4 +50,4 @@ Medium severity Collect SQL declarations recursively before binding parameters
 
 ```
 
-However , I was tired. And it is not an work project. I decided to let it go. 
+However, I felt tired. This was not a work project, so I decided to stop.

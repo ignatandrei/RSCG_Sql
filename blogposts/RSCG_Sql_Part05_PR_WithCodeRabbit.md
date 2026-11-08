@@ -1,4 +1,4 @@
-I had tests and the other required work, so I thought the project was done.
+I had tests and the other required work, so I considered the project complete.
 
 I created a pull request and asked CodeRabbit to review it. To my surprise, it found several issues. I agree with the findings below:
 
